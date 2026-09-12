@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+oled_status.py -- one-file OLED status display for Linux SBCs.
+
+Nothing is hard-coded to a board. At startup it works out:
+
+  * the board model                (device-tree / cpuinfo)
+  * which I2C bus the panel is on  (scans every /dev/i2c-*)
+  * the panel address              (0x3C / 0x3D)
+  * a usable monospace font        (falls back to PIL's built-in)
+  * where the CPU temperature is   (thermal zones, then vcgencmd)
+  * the default-route interface    (/proc/net/route)
+  * which known services exist     (systemd)
+  * how many rows fit the panel    (128x64, 128x32, ... all fine)
+
+So the same file runs on a Raspberry Pi, a BeagleBone Black/Blue, or
+anything else with an I2C SSD1306/SH1106 hanging off it.
+
+Install
+-------
+    sudo apt install -y python3-pil i2c-tools
+    pip3 install luma.oled           # or: sudo apt install python3-luma.oled
+    sudo raspi-config nonint do_i2c 0          # Pi: enable I2C
+    sudo usermod -aG i2c $USER                 # then log out/in
+
+Use
+---
+    ./oled_status.py                  # run it
+    ./oled_status.py --probe          # print what it detected, exit
+    ./oled_status.py --simulate       # draw to the terminal, no hardware
+    ./oled_status.py --service foo    # watch extra units (repeatable)
+    sudo ./oled_status.py --install   # write + enable a systemd unit
+    sudo ./oled_status.py --uninstall
+
+Written for Ryan Lush. MIT.
+"""
+
+import argparse
+import contextlib
+import glob
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+I2C_ADDRS = (0x3C, 0x3D)
+
+# Services worth showing if they happen to be installed. Anything passed with
+# --service is added to this list.
+KNOWN_SERVICES = (
+    "balance_bot",
+    "hailo-tracker",
+    "tunehud",
+    "bbboled",
+    "oled-status",
+)
+
+BATT_PATHS = (
+    "/run/batt_status.json",
+    "/run/battery.json",
+    "/tmp/batt_status.json",
+)
+
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+)
+
+UNIT_NAME = "oled-status"
+LABEL_W = 5  # columns reserved for the row label
+
+_cache = {}
+
+
+def cached(ttl):
+    """Memoize a cheap-to-call/expensive-to-run reader for `ttl` seconds."""
+    def deco(fn):
+        def wrapper(*args):
+            key = (fn.__name__, args)
+            now = time.monotonic()
+            hit = _cache.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1]
+            try:
+                val = fn(*args)
+            except Exception:
+                val = None
+            _cache[key] = (now, val)
+            return val
+        return wrapper
+    return deco
+
+
+def slurp(path, limit=4096):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", "replace").strip("\x00\n ")
+    except Exception:
+        return None
+
+
+def run(cmd, timeout=2.0):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------------------
+# hardware / platform detection
+# --------------------------------------------------------------------------
+
+def detect_board():
+    """(model string, family) where family is pi | bbb | jetson | generic."""
+    model = (slurp("/proc/device-tree/model")
+             or slurp("/sys/firmware/devicetree/base/model")
+             or "")
+    if not model:
+        cpuinfo = slurp("/proc/cpuinfo", 65536) or ""
+        m = re.search(r"^(?:Model|Hardware)\s*:\s*(.+)$", cpuinfo, re.M)
+        model = m.group(1).strip() if m else ""
+    low = model.lower()
+    if "raspberry" in low:
+        family = "pi"
+    elif "beagle" in low or "am335x" in low or "am62" in low:
+        family = "bbb"
+    elif "jetson" in low or "tegra" in low:
+        family = "jetson"
+    else:
+        family = "generic"
+    return model or "unknown board", family
+
+
+def i2c_buses():
+    nums = []
+    for path in glob.glob("/dev/i2c-*"):
+        try:
+            nums.append(int(path.rsplit("-", 1)[1]))
+        except ValueError:
+            pass
+    return sorted(nums)
+
+
+def probe_i2c(bus, addr):
+    """True if something ACKs at `addr` on `bus`."""
+    try:
+        from smbus2 import SMBus
+    except ImportError:
+        # i2c-tools fallback: parse the i2cdetect grid.
+        grid = run(["i2cdetect", "-y", str(bus)], timeout=4)
+        return f"{addr:02x}" in grid.lower().split()
+    try:
+        with SMBus(bus) as bus_handle:
+            bus_handle.write_quick(addr)
+        return True
+    except Exception:
+        return False
+
+
+def find_display(preferred_bus=None, preferred_addr=None):
+    """Scan for a panel. Returns (bus, addr) or (None, None)."""
+    buses = i2c_buses()
+    if preferred_bus is not None:
+        buses = [preferred_bus] + [b for b in buses if b != preferred_bus]
+    addrs = [preferred_addr] if preferred_addr else list(I2C_ADDRS)
+    for bus in buses:
+        for addr in addrs:
+            if probe_i2c(bus, addr):
+                return bus, addr
+    return None, None
+
+
+def pick_font(size):
+    from PIL import ImageFont
+    paths = list(FONT_CANDIDATES)
+    paths += sorted(glob.glob("/usr/share/fonts/**/*Mono*.ttf", recursive=True))
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+# --------------------------------------------------------------------------
+# metrics
+# --------------------------------------------------------------------------
+
+@cached(5)
+def hostname():
+    return socket.gethostname().split(".")[0]
+
+
+@cached(5)
+def default_iface():
+    routes = slurp("/proc/net/route", 65536) or ""
+    for line in routes.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) > 2 and cols[1] == "00000000":
+            return cols[0]
+    return None
+
+
+@cached(5)
+def ip_address():
+    iface = default_iface()
+    if iface:
+        addr = run(["ip", "-4", "-o", "addr", "show", "dev", iface])
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", addr)
+        if m:
+            return m.group(1)
+    # No default route (or no `ip`): ask the kernel which source it would use.
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.4)
+        sock.connect(("8.8.8.8", 80))
+        addr = sock.getsockname()[0]
+        sock.close()
+        return addr
+    except Exception:
+        return None
+
+
+@cached(10)
+def wifi():
+    """(ssid, dBm) for the default interface, or None if it isn't wireless."""
+    iface = default_iface()
+    if not iface or not os.path.isdir(f"/sys/class/net/{iface}/wireless"):
+        return None
+    ssid = run(["iwgetid", "-r"]) or "?"
+    dbm = None
+    wl = slurp("/proc/net/wireless", 8192) or ""
+    for line in wl.splitlines():
+        if line.strip().startswith(iface + ":"):
+            cols = line.split()
+            if len(cols) > 3:
+                try:
+                    dbm = int(float(cols[3].rstrip(".")))
+                except ValueError:
+                    pass
+    return ssid, dbm
+
+
+class CpuMeter:
+    """Percent busy between successive calls, from /proc/stat."""
+
+    def __init__(self):
+        self.prev = None
+
+    def read(self):
+        try:
+            with open("/proc/stat") as fh:
+                cols = [float(x) for x in fh.readline().split()[1:]]
+        except Exception:
+            return None
+        total, idle = sum(cols), cols[3] + (cols[4] if len(cols) > 4 else 0.0)
+        prev, self.prev = self.prev, (total, idle)
+        if prev is None:
+            return None
+        d_total, d_idle = total - prev[0], idle - prev[1]
+        if d_total <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+
+
+@cached(30)
+def temp_source():
+    """Path of the most CPU-ish thermal zone, if there is one."""
+    best = None
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        kind = (slurp(f"{zone}/type") or "").lower()
+        if any(k in kind for k in ("cpu", "soc", "package", "x86_pkg")):
+            return f"{zone}/temp"
+        best = best or f"{zone}/temp"
+    return best
+
+
+@cached(2)
+def cpu_temp():
+    path = temp_source()
+    if path:
+        raw = slurp(path)
+        if raw and raw.lstrip("-").isdigit():
+            val = float(raw)
+            return val / 1000.0 if abs(val) > 200 else val
+    out = run(["vcgencmd", "measure_temp"])
+    m = re.search(r"([\d.]+)", out)
+    return float(m.group(1)) if m else None
+
+
+@cached(10)
+def throttled():
+    """Pi undervoltage/throttle flags, as a short string. '' when healthy."""
+    out = run(["vcgencmd", "get_throttled"])
+    m = re.search(r"0x([0-9a-fA-F]+)", out)
+    if not m:
+        return None
+    bits = int(m.group(1), 16)
+    if bits == 0:
+        return ""
+    flags = []
+    if bits & 0x1:
+        flags.append("UV")
+    if bits & 0x2:
+        flags.append("FREQ")
+    if bits & 0x4:
+        flags.append("THROT")
+    if bits & 0x8:
+        flags.append("TEMP")
+    if not flags and bits & 0xF0000:
+        flags.append("past")
+    return ",".join(flags) or "past"
+
+
+@cached(3)
+def memory():
+    info = {}
+    for line in (slurp("/proc/meminfo", 4096) or "").splitlines():
+        key, _, rest = line.partition(":")
+        try:
+            info[key] = int(rest.split()[0])
+        except (IndexError, ValueError):
+            pass
+    total = info.get("MemTotal")
+    avail = info.get("MemAvailable", info.get("MemFree"))
+    if not total or avail is None:
+        return None
+    used = total - avail
+    return used // 1024, total // 1024, 100.0 * used / total
+
+
+@cached(30)
+def disk(path="/"):
+    st = os.statvfs(path)
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    used = total - free
+    return used / 1e9, total / 1e9, 100.0 * used / total if total else 0.0
+
+
+@cached(2)
+def uptime():
+    raw = slurp("/proc/uptime")
+    secs = int(float(raw.split()[0])) if raw else 0
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    return f"{days}d {hours:02d}:{mins:02d}" if days else f"{hours:02d}:{mins:02d}"
+
+
+@cached(30)
+def installed_services(extra=()):
+    """Whichever of the known/requested units actually exist on this box."""
+    wanted = list(dict.fromkeys(list(extra) + list(KNOWN_SERVICES)))
+    listing = run(["systemctl", "list-unit-files", "--type=service",
+                   "--no-legend", "--no-pager"], timeout=6)
+    present = {line.split()[0] for line in listing.splitlines() if line.split()}
+    found = []
+    for name in wanted:
+        unit = name if name.endswith(".service") else name + ".service"
+        if unit in present or name in ("",):
+            found.append(name)
+        elif not listing and run(["systemctl", "is-active", unit]):
+            found.append(name)  # no listing available; unit answered anyway
+    return found
+
+
+@cached(2)
+def service_state(name):
+    out = run(["systemctl", "is-active", name], timeout=2)
+    return out or "unknown"
+
+
+@cached(10)
+def pi_power():
+    """(5V rail volts, total watts) from the Pi 5 PMIC. None anywhere else.
+
+    Stands in for the battery readout on boards that run off a wall supply.
+    `vcgencmd pmic_read_adc` reports each rail as a NAME_A current and a
+    NAME_V voltage, so pairing them up by prefix gives board power.
+    """
+    out = run(["vcgencmd", "pmic_read_adc"], timeout=3)
+    if not out or "volt(" not in out:
+        return None
+    vals = dict(re.findall(r"(\S+?)\s+(?:volt|current)\(\d+\)=([\d.]+)", out))
+    watts = 0.0
+    for name, amps in vals.items():
+        if name.endswith("_A"):
+            volts = vals.get(name[:-2] + "_V")
+            if volts:
+                watts += float(amps) * float(volts)
+    rail = vals.get("EXT5V_V")
+    if rail is None and not watts:
+        return None
+    return (float(rail) if rail else None), watts
+
+
+@cached(2)
+def battery(path=None):
+    """(volts, percent) from a JSON status file, either key optional."""
+    paths = [path] if path else list(BATT_PATHS)
+    for candidate in paths:
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate) as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        volts = pct = None
+        for key in ("voltage", "voltage_v", "volts", "v"):
+            if key in data:
+                volts = float(data[key])
+                break
+        for key in ("percent", "pct", "soc", "capacity"):
+            if key in data:
+                pct = float(data[key])
+                break
+        if volts is not None or pct is not None:
+            return volts, pct
+    return None
+
+
+# --------------------------------------------------------------------------
+# pages
+# --------------------------------------------------------------------------
+
+def row(label, value):
+    return f"{label:<{LABEL_W}}{value}"
+
+
+def page_net():
+    rows = [row("HOST", hostname() or "?"),
+            row("IP", ip_address() or "no link")]
+    iface = default_iface()
+    link = wifi()
+    if link:
+        ssid, dbm = link
+        rows.append(row("SSID", ssid))
+        rows.append(row("RSSI", f"{dbm} dBm" if dbm is not None else "?"))
+    elif iface:
+        rows.append(row("IF", iface))
+    return "NET", rows
+
+
+def page_sys(cpu):
+    """Four rows, so it lands on one screen of a 128x64 panel."""
+    rows = []
+    load = os.getloadavg()[0]
+    rows.append(row("CPU", f"{cpu:3.0f}%  ld {load:.2f}" if cpu is not None
+                    else f"ld {load:.2f}"))
+
+    temp = cpu_temp()
+    flags = throttled()
+    temp_txt = f"{temp:.1f}C" if temp is not None else "--"
+    if flags:
+        temp_txt += "  !" + flags
+    rows.append(row("TEMP", temp_txt))
+
+    mem = memory()
+    if mem:
+        used, total, pct = mem
+        rows.append(row("MEM", f"{used}/{total}M {pct:.0f}%"))
+
+    dsk = disk()
+    tail = f"UP {uptime()}"
+    if dsk:
+        rows.append(row("DISK", f"{dsk[2]:.0f}%  {tail}"))
+    else:
+        rows.append(row("UP", uptime()))
+    return "SYS", rows
+
+
+def page_svc(services, batt_path):
+    rows = []
+    for name in services:
+        state = service_state(name)
+        short = {"active": "up", "inactive": "down", "failed": "FAIL",
+                 "activating": "start", "deactivating": "stop"}.get(state, state)
+        label = name.replace(".service", "")
+        rows.append(f"{label[:13]:<14}{short}")
+    batt = battery(batt_path)
+    if batt:
+        volts, pct = batt
+        text = " ".join(x for x in (f"{volts:.2f}V" if volts is not None else None,
+                                    f"{pct:.0f}%" if pct is not None else None) if x)
+        rows.append(row("BATT", text))
+    else:
+        # No battery file (a Pi on a wall wart): show the board's own rail.
+        power = pi_power()
+        if power:
+            rail, watts = power
+            text = " ".join(x for x in (f"{rail:.2f}V" if rail else None,
+                                        f"{watts:.1f}W" if watts else None) if x)
+            rows.append(row("PWR", text))
+    return ("SVC", rows) if rows else (None, [])
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def frame(device):
+    """Like luma's canvas(), but works with any object exposing size/mode/display."""
+    from PIL import Image, ImageDraw
+    img = Image.new(getattr(device, "mode", "1"), device.size)
+    yield ImageDraw.Draw(img)
+    device.display(img)
+
+
+class Screen:
+    def __init__(self, device, font_size=9, header=True):
+        self.device = device
+        self.width, self.height = device.size
+        self.font = pick_font(font_size)
+        self.small = pick_font(max(7, font_size - 1))
+        self.line_h = font_size + 2
+        self.header = header and self.height >= 48
+        self.hdr_h = self.line_h + 2 if self.header else 0
+        self.rows_per_screen = max(1, (self.height - self.hdr_h) // self.line_h)
+        try:
+            self.char_w = self.font.getlength("M") or 6
+        except AttributeError:
+            self.char_w = self.font.getsize("M")[0] or 6
+        self.cols = max(8, int(self.width // self.char_w))
+
+    def fit(self, text):
+        return text if len(text) <= self.cols else text[:self.cols]
+
+    def render(self, title, rows, beat):
+        with frame(self.device) as draw:
+            top = 0
+            if self.header:
+                draw.rectangle((0, 0, self.width - 1, self.hdr_h - 1), fill="white")
+                draw.text((2, 0), f"{title} {hostname() or ''}"[:self.cols],
+                          font=self.small, fill="black")
+                dot = (self.width - 9, 2, self.width - 3, self.hdr_h - 4)
+                draw.rectangle(dot, outline="black",
+                               fill="black" if beat else "white")
+                top = self.hdr_h + 1
+            for i, text in enumerate(rows[:self.rows_per_screen]):
+                draw.text((2, top + i * self.line_h), self.fit(text),
+                          font=self.font, fill="white")
+            if not self.header:
+                draw.point((self.width - 2, 0), fill="white" if beat else "black")
+
+    def splash(self, model):
+        words, lines, cur = model.split(), [], ""
+        for word in words:
+            trial = (cur + " " + word).strip()
+            if len(trial) <= self.cols:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        lines.append(cur)
+        with frame(self.device) as draw:
+            for i, text in enumerate(lines[:self.rows_per_screen + 1]):
+                draw.text((2, i * self.line_h), self.fit(text),
+                          font=self.font, fill="white")
+
+
+class TerminalDevice:
+    """--simulate target: keeps the last frame so we can print it."""
+
+    def __init__(self, width=128, height=64):
+        self.size = (width, height)
+        self.mode = "1"
+        self.image = None
+
+    def display(self, image):
+        self.image = image.copy()
+
+    def show(self):
+        if self.image is None:
+            return
+        px = self.image.convert("1").load()
+        width, height = self.size
+        out = ["+" + "-" * width + "+"]
+        for y in range(0, height, 2):
+            line = []
+            for x in range(width):
+                top = px[x, y] != 0
+                bot = px[x, y + 1] != 0 if y + 1 < height else False
+                line.append("█" if top and bot else
+                            "▀" if top else "▄" if bot else " ")
+            out.append("|" + "".join(line) + "|")
+        out.append("+" + "-" * width + "+")
+        sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(out) + "\n")
+        sys.stdout.flush()
+
+    def cleanup(self):
+        pass
+
+
+def open_device(args):
+    """Connect to the panel, scanning for it unless told exactly where it is."""
+    try:
+        from luma.core.interface.serial import i2c
+    except ImportError:
+        sys.exit("luma.oled is missing. Install it with:\n"
+                 "    sudo apt install -y python3-luma.oled\n"
+                 "  or pip3 install luma.oled\n"
+                 "(--simulate needs only Pillow, if you just want to see it.)")
+    bus, addr = find_display(args.i2c_bus, args.i2c_addr)
+    if bus is None:
+        if args.i2c_bus is None:
+            raise RuntimeError(
+                "no SSD1306/SH1106 found on " +
+                (", ".join(f"/dev/i2c-{b}" for b in i2c_buses()) or "any I2C bus")
+                + " -- is I2C enabled and the panel wired?")
+        bus, addr = args.i2c_bus, args.i2c_addr or I2C_ADDRS[0]
+    serial = i2c(port=bus, address=addr)
+    if args.driver == "sh1106":
+        from luma.oled.device import sh1106 as driver
+    elif args.driver == "ssd1309":
+        from luma.oled.device import ssd1309 as driver
+    else:
+        from luma.oled.device import ssd1306 as driver
+    device = driver(serial, width=args.width, height=args.height,
+                    rotate=args.rotate)
+    if args.contrast is not None:
+        device.contrast(args.contrast)
+    return device, bus, addr
+
+
+# --------------------------------------------------------------------------
+# systemd
+# --------------------------------------------------------------------------
+
+def exec_args(args):
+    out = []
+    for name in args.service:
+        out += ["--service", name]
+    if args.i2c_bus is not None:
+        out += ["--i2c-bus", str(args.i2c_bus)]
+    if args.i2c_addr is not None:
+        out += ["--i2c-addr", hex(args.i2c_addr)]
+    if args.driver != "ssd1306":
+        out += ["--driver", args.driver]
+    if (args.width, args.height) != (128, 64):
+        out += ["--width", str(args.width), "--height", str(args.height)]
+    if args.rotate:
+        out += ["--rotate", str(args.rotate)]
+    if args.battery:
+        out += ["--battery", args.battery]
+    if args.refresh != 1.0:
+        out += ["--refresh", str(args.refresh)]
+    if args.page_sec != 4.0:
+        out += ["--page-sec", str(args.page_sec)]
+    return out
+
+
+def unit_text(args):
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"
+    script = os.path.abspath(__file__)
+    cmd = " ".join([sys.executable, script] + exec_args(args))
+    return f"""[Unit]
+Description=OLED Status Display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+SupplementaryGroups=i2c
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory={os.path.dirname(script)}
+ExecStart={cmd}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def install_service(args):
+    if os.geteuid() != 0:
+        sys.exit("--install needs root: sudo %s --install" % sys.argv[0])
+    path = f"/etc/systemd/system/{UNIT_NAME}.service"
+    with open(path, "w") as fh:
+        fh.write(unit_text(args))
+    run(["systemctl", "daemon-reload"], timeout=15)
+    run(["systemctl", "enable", "--now", UNIT_NAME], timeout=20)
+    print(f"wrote {path} and started {UNIT_NAME}")
+    print(run(["systemctl", "--no-pager", "status", UNIT_NAME], timeout=10))
+
+
+def uninstall_service():
+    if os.geteuid() != 0:
+        sys.exit("--uninstall needs root")
+    run(["systemctl", "disable", "--now", UNIT_NAME], timeout=20)
+    path = f"/etc/systemd/system/{UNIT_NAME}.service"
+    if os.path.exists(path):
+        os.remove(path)
+    run(["systemctl", "daemon-reload"], timeout=15)
+    print(f"removed {path}")
+
+
+def probe_report(args):
+    model, family = detect_board()
+    print(f"board       {model}  (family: {family})")
+    buses = i2c_buses()
+    print(f"i2c buses   {', '.join(str(b) for b in buses) or 'none -- I2C not enabled?'}")
+    for bus in buses:
+        hits = [hex(a) for a in I2C_ADDRS if probe_i2c(bus, a)]
+        print(f"  bus {bus}     {', '.join(hits) if hits else 'no display'}")
+    bus, addr = find_display(args.i2c_bus, args.i2c_addr)
+    print(f"display     {'bus %d @ %s' % (bus, hex(addr)) if bus is not None else 'not found'}")
+    print(f"font        {getattr(pick_font(9), 'path', 'PIL built-in')}")
+    print(f"temp source {temp_source() or 'vcgencmd / none'}")
+    print(f"iface       {default_iface()}  ip {ip_address()}")
+    print(f"services    {', '.join(installed_services(tuple(args.service))) or 'none found'}")
+    batt = battery(args.battery)
+    print(f"battery     {batt if batt else 'no status file'}")
+    power = pi_power()
+    print(f"pmic        {power if power else 'not a Pi 5 / vcgencmd unavailable'}")
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Auto-detecting OLED status display for Linux SBCs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--service", action="append", default=[],
+                   help="extra systemd unit to watch (repeatable)")
+    p.add_argument("--battery", help="JSON file holding battery voltage/percent")
+    p.add_argument("--i2c-bus", type=int, help="force an I2C bus instead of scanning")
+    p.add_argument("--i2c-addr", type=lambda s: int(s, 0), help="force the panel address")
+    p.add_argument("--driver", default="ssd1306",
+                   choices=("ssd1306", "sh1106", "ssd1309"))
+    p.add_argument("--width", type=int, default=128)
+    p.add_argument("--height", type=int, default=64)
+    p.add_argument("--rotate", type=int, default=0, choices=(0, 1, 2, 3),
+                   help="90-degree steps")
+    p.add_argument("--contrast", type=int, help="0-255")
+    p.add_argument("--font-size", type=int, default=9)
+    p.add_argument("--refresh", type=float, default=1.0, help="seconds per frame")
+    p.add_argument("--page-sec", type=float, default=4.0, help="seconds per page")
+    p.add_argument("--no-header", action="store_true")
+    p.add_argument("--probe", action="store_true", help="report detection and exit")
+    p.add_argument("--simulate", action="store_true",
+                   help="render to the terminal, no hardware needed")
+    p.add_argument("--once", action="store_true", help="draw one frame and exit")
+    p.add_argument("--install", action="store_true", help="write + enable a systemd unit")
+    p.add_argument("--uninstall", action="store_true")
+    p.add_argument("--print-unit", action="store_true", help="dump the unit file")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.probe:
+        probe_report(args)
+        return 0
+    if args.print_unit:
+        sys.stdout.write(unit_text(args))
+        return 0
+    if args.install:
+        install_service(args)
+        return 0
+    if args.uninstall:
+        uninstall_service()
+        return 0
+
+    model, _family = detect_board()
+    stop = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.append(True))
+
+    cpu = CpuMeter()
+    device = screen = None
+    beat = False
+    screen_idx = 0
+    last_flip = time.monotonic()
+
+    while not stop:
+        if device is None:
+            try:
+                if args.simulate:
+                    device = TerminalDevice(args.width, args.height)
+                    bus = addr = None
+                else:
+                    device, bus, addr = open_device(args)
+                screen = Screen(device, args.font_size, not args.no_header)
+                screen.splash(model)
+                if not args.simulate:
+                    print(f"OLED on i2c-{bus} @ {hex(addr)}, "
+                          f"{device.size[0]}x{device.size[1]}", flush=True)
+                time.sleep(0.8)
+            except Exception as exc:
+                if args.once:
+                    sys.exit(f"error: {exc}")
+                print(f"display not ready: {exc}", file=sys.stderr, flush=True)
+                device = None
+                time.sleep(3)
+                continue
+
+        try:
+            services = installed_services(tuple(args.service)) or []
+            pages = [page_net(), page_sys(cpu.read()),
+                     page_svc(services, args.battery)]
+
+            # Flatten into panel-sized screens so a 128x32 works unchanged.
+            screens = []
+            for title, rows in pages:
+                if not title or not rows:
+                    continue
+                step = screen.rows_per_screen
+                for i in range(0, len(rows), step):
+                    screens.append((title, rows[i:i + step]))
+            if not screens:
+                screens = [("SYS", [row("HOST", hostname() or "?")])]
+
+            now = time.monotonic()
+            if now - last_flip >= args.page_sec:
+                screen_idx += 1
+                last_flip = now
+            title, rows = screens[screen_idx % len(screens)]
+            screen.render(title, rows, beat)
+            if args.simulate:
+                device.show()
+            beat = not beat
+
+            if args.once:
+                break
+            time.sleep(args.refresh)
+
+        except Exception as exc:  # most likely an I2C hiccup -- reconnect
+            print(f"display error, reconnecting: {exc}", file=sys.stderr, flush=True)
+            device = None
+            time.sleep(2)
+
+    if device is not None:
+        try:
+            device.cleanup()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
