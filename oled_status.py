@@ -395,8 +395,10 @@ class Layout:
     --no-header gives back plain rows over the whole panel.
     """
 
-    def __init__(self, width, height, banner_h=BANNER_H, header=True):
+    def __init__(self, width, height, banner_h=BANNER_H, header=True,
+                 invert=False):
         self.width, self.height = width, height
+        self.invert = invert
         # A bar is only worth it if what is left under it is still legible --
         # two body rows' worth. Note the test is on what REMAINS, not on some
         # multiple of the band: --banner-h is the caller telling us what the
@@ -412,7 +414,8 @@ class Layout:
         self.dot = max(5, min(self.banner_h - 6 if self.banner_h else 6, 8))
 
     def describe(self):
-        return (f"{self.width}x{self.height} banner={self.banner_h} "
+        return (f"{self.width}x{self.height} banner={self.banner_h}"
+                f"{' inverted' if self.invert else ''} "
                 f"rows={self.n_rows} pitch={self.pitch}")
 
 
@@ -456,20 +459,32 @@ def draw_page(draw, layout, fonts, page, beat, alive):
     rows = page.rows
 
     if layout.banner_h:
-        # Inverse bar. On a two-colour panel it lights the yellow segment
-        # solid, which is the point: the split now looks deliberate instead of
-        # like a rendering fault. --no-header is the way out if the standing
-        # highlight ever worries you for burn-in.
-        draw.rectangle((0, 0, width - 1, layout.banner_h - 1), fill="white")
         _, th = _size(draw, "Ag", bar_font)
         ty = max(0, (layout.banner_h - th) // 2) - 1
-        draw.text((MARGIN_X, ty), page.title, font=bar_font, fill="black")
         tag_w = _size(draw, page.tag, bar_font)[0]
         tag_x = width - MARGIN_X - layout.dot - 4 - tag_w
-        draw.text((tag_x, ty), page.tag, font=bar_font, fill="black")
+        if layout.invert:
+            # Solid bar. OFF BY DEFAULT, and the reason is the panel, not
+            # taste. On the bot's module a filled region draws enough current
+            # that entire rows drop out of it -- two blank lines through the
+            # fill. Confirmed by displaying a full-screen white frame straight
+            # through luma, bypassing everything in this file: the same two
+            # lines. That is the charge pump giving up, so the fix is to stop
+            # asking a 128x16 region to light at once. --invert-header turns it
+            # back on for a panel with the supply to hold it.
+            draw.rectangle((0, 0, width - 1, layout.banner_h - 1), fill="white")
+            ink, paper = "black", "white"
+        else:
+            ink, paper = "white", "black"
+            # One lit row instead of sixteen: still separates header from body
+            # on a single-colour panel, at a sixteenth of the current.
+            draw.line((0, layout.banner_h - 1, width - 1, layout.banner_h - 1),
+                      fill="white")
+        draw.text((MARGIN_X, ty), page.title, font=bar_font, fill=ink)
+        draw.text((tag_x, ty), page.tag, font=bar_font, fill=ink)
         _beat(draw, layout, beat, alive,
               x1=width - MARGIN_X, y0=(layout.banner_h - layout.dot) // 2,
-              ink="black", paper="white")
+              ink=ink, paper=paper)
         top_reserved = 0
     else:
         top_reserved = layout.dot + 2
@@ -1183,6 +1198,8 @@ def exec_args(args):
         out += ["--no-header"]
     if args.banner_h != BANNER_H:
         out += ["--banner-h", str(args.banner_h)]
+    if args.invert_header:
+        out += ["--invert-header"]
     return out
 
 
@@ -1291,7 +1308,7 @@ def probe_report(args):
     _, _, font_path = load_fonts(args.font, args.font_size or
                                  auto_font_size(args.height))
     print(f"font         {font_path} @ {args.font_size or auto_font_size(args.height)}pt")
-    print(f"layout       {Layout(args.width, args.height, args.banner_h, not args.no_header).describe()}")
+    print(f"layout       {Layout(args.width, args.height, args.banner_h, not args.no_header, args.invert_header).describe()}")
     print(f"temp source  {temp_source() or 'vcgencmd / none'}")
     print(f"iface        {default_iface()}  ip {ip_address()}")
     print(f"services     {', '.join(installed_services(tuple(args.service))) or 'none found'}")
@@ -1355,6 +1372,11 @@ def parse_args(argv=None):
                         f"this row.")
     p.add_argument("--no-header", action="store_true",
                    help="single-colour panel: drop the bar and use plain rows")
+    p.add_argument("--invert-header", action="store_true",
+                   help="fill the header band solid and draw the title in "
+                        "black. Looks sharper, but a panel whose charge pump "
+                        "cannot hold a filled region drops whole rows out of "
+                        "it — check with a full-screen white frame first")
     p.add_argument("--pages", type=page_list, default=None,
                    help=f"comma-separated subset of "
                         f"{','.join(PAGE_BUILDERS)} (default: all)")
@@ -1481,7 +1503,8 @@ def main(argv=None):
 
     body_font, bar_font, font_path = load_fonts(args.font, args.font_size)
     LOG.debug("font %s at %dpt", font_path, args.font_size)
-    layout = Layout(args.width, args.height, args.banner_h, not args.no_header)
+    layout = Layout(args.width, args.height, args.banner_h,
+                    not args.no_header, args.invert_header)
     LOG.debug("layout %s", layout.describe())
 
     if args.png:

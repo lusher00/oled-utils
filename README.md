@@ -48,7 +48,15 @@ half-erased line, and nothing about the data explains it, because the data was
 always fine.
 
 So: the header bar is sized to fill the band exactly, the body starts below the
-gap, and **nothing is ever drawn across row 16**. If your panel's segment is a
+gap, and **nothing is ever drawn across row 16**.
+
+The header is drawn as lit text over a single-row rule rather than as a solid
+filled bar, and that is a hardware decision, not a taste one. On the
+BeagleBone's panel a filled 128x16 region draws enough current that whole rows
+drop out of it — verified by pushing a full-screen white frame straight through
+luma, which showed the same dropouts, so it is the charge pump and not the
+drawing code. `--invert-header` gives the solid bar back on a panel with the
+supply to hold it. If your panel's segment is a
 different height, `--banner-h N` moves the line; `--no-header` drops the bar and
 uses plain rows for a single-colour panel.
 
