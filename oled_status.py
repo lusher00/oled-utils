@@ -66,6 +66,7 @@ Use
 """
 
 import argparse
+import grp
 import contextlib
 import glob
 import json
@@ -1263,21 +1264,43 @@ def exec_args(args):
     return out
 
 
+def supplementary_groups():
+    """Existing groups that can own an I2C device on this machine.
+
+    systemd exits with status 216/GROUP if even one named supplementary group
+    does not exist, so the unit must not blindly name both distro conventions.
+    """
+    names = {"i2c", "gpio"}
+    for path in glob.glob("/dev/i2c-*"):
+        try:
+            names.add(grp.getgrgid(os.stat(path).st_gid).gr_name)
+        except (KeyError, OSError):
+            pass
+    existing = []
+    for name in sorted(names):
+        try:
+            grp.getgrnam(name)
+        except KeyError:
+            continue
+        existing.append(name)
+    return existing
+
+
 def unit_text(args):
     user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"
     script = os.path.abspath(__file__)
     cmd = " ".join([sys.executable, "-u", script] + exec_args(args))
+    groups = supplementary_groups()
+    groups_line = ("SupplementaryGroups=" + " ".join(groups) + "\n"
+                   if groups else "")
     # The hardening below is not decoration; each line is here for a reason
     # recorded in the bot's HANDOFF notes:
     #   * network.target, not network-online.target -- the display shows
     #     "no link" quite happily and there is no reason to hold up boot by
     #     tens of seconds waiting for DHCP just to draw a status screen.
-    #   * SupplementaryGroups lists i2c AND gpio. Most images ship /dev/i2c-*
-    #     as root:i2c, but the BeagleBone image ships it root:gpio -- a unit
-    #     granting only i2c started fine and then exited 1 on first bus access,
-    #     which systemd reported as a restart loop with no hint of a permission
-    #     problem. Naming a group that does not exist is harmless. usermod -aG
-    #     is NOT sufficient: systemd starts the service with exactly these.
+    #   * SupplementaryGroups uses whichever of i2c/gpio actually exists plus
+    #     the group owning /dev/i2c-*. Most Pi images use i2c; the BeagleBone
+    #     image uses gpio. Naming a missing group makes systemd exit 216/GROUP.
     #   * StartLimit* with --give-up-after: five starts must fit inside the
     #     interval for systemd to ever give up. 5 x (15 + 5) = 100 < 120.
     #   * RuntimeDirectory is both where the status file goes and how this
@@ -1293,7 +1316,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User={user}
-SupplementaryGroups=i2c gpio
+{groups_line.rstrip()}
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory={os.path.dirname(script)}
 ExecStart={cmd}
