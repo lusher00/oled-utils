@@ -83,12 +83,10 @@ beyond `char-i2c`) and it refuses to install over another unit that already
 drives a panel, because two of those on one bus is a dead screen with no error
 anywhere.
 
-`SupplementaryGroups=i2c gpio` lists both names on purpose. Most images ship
-`/dev/i2c-*` as `root:i2c`; the BeagleBone image ships it `root:gpio`, and a
-unit granting only `i2c` starts fine and then exits 1 on first bus access,
-which systemd reports as a restart loop with no hint of a permission problem.
-`usermod -aG` is not sufficient: systemd starts a service with exactly the
-groups the unit names.
+The installer adds only I2C access groups that exist on the current machine.
+Most images ship `/dev/i2c-*` as `root:i2c`; the BeagleBone image uses
+`root:gpio`. A unit naming a nonexistent group exits before Python starts with
+systemd status `216/GROUP`, so blindly listing both names is not portable.
 
 The service publishes its own status to `$RUNTIME_DIRECTORY/status.json`, which
 systemd creates on start and removes on stop. That file exists because a
