@@ -108,6 +108,7 @@ SERVICE_LABELS = {
 
 BATT_PATHS = (
     "/run/batt_status.json",
+    "/run/robot-link/status.json",
     "/run/battery.json",
     "/tmp/batt_status.json",
 )
@@ -121,7 +122,7 @@ FONT_CANDIDATES = (
 )
 
 UNIT_NAME = "oled-status"
-BATT_STALE_SEC = 30.0             # older than this and the reading is unknown
+BATT_STALE_SEC = 120.0            # batt_monitor normally publishes each 60s
 STATUS_WRITE_SEC = 5.0            # how often to republish our own status
 
 # Highlight band on the two-colour panels: rows 0..15 are a separate yellow
@@ -567,6 +568,35 @@ def ip_address():
         return None
 
 
+@cached(5)
+def ipv4_addresses():
+    """Active non-loopback IPv4 addresses, default-route interface first."""
+    found = []
+    output = run(["ip", "-4", "-o", "addr", "show", "up"])
+    for line in output.splitlines():
+        match = re.search(
+            r"^\d+:\s+([^\s:@]+)(?:@\S+)?\s+inet\s+"
+            r"(\d+\.\d+\.\d+\.\d+)/", line)
+        if not match:
+            continue
+        iface, address = match.groups()
+        if iface != "lo" and not address.startswith("127."):
+            found.append((iface, address))
+    preferred = default_iface()
+    return sorted(found, key=lambda item: item[0] != preferred)
+
+
+def address_label(iface, address):
+    """Short, useful OLED label for an interface address."""
+    if address.startswith("192.168.7.") or iface.startswith("usb"):
+        return "USB"
+    if os.path.isdir(f"/sys/class/net/{iface}/wireless"):
+        return "WIFI"
+    if iface.startswith(("eth", "en")):
+        return "ETH"
+    return iface.upper()[:5]
+
+
 @cached(10)
 def wifi():
     """(ssid, dBm) for the default interface, or None if it isn't wireless."""
@@ -717,6 +747,24 @@ def service_state(name):
     return run(["systemctl", "is-active", name], timeout=2) or "unknown"
 
 
+@cached(1)
+def robot_link_connected(path="/run/robot-link/status.json"):
+    """Pi-to-Bone session state published by robot-linkd, or None if absent."""
+    try:
+        with open(path) as fh:
+            return bool(json.load(fh).get("connected"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def indicator_alive(args):
+    """Use the real Pi-to-Bone session for the heartbeat when available."""
+    services = installed_services(tuple(args.service))
+    if "robot-linkd" in services and service_state("robot-linkd") == "active":
+        return robot_link_connected() is True
+    return service_state(args.primary) == "active"
+
+
 def service_label(name, width=4):
     known = SERVICE_LABELS.get(name)
     if known:
@@ -838,21 +886,25 @@ def page_bot(args, cpu_pct, budget):
 
 
 def page_net(args, cpu_pct, budget):
+    primary = ip_address()
     rows = [("HOST", hostname() or "?"),
-            ("IP", ip_address() or "no link")]
+            ("IP", primary or "no link")]
+    for iface, address in ipv4_addresses():
+        if address != primary:
+            rows.append((address_label(iface, address), address))
+            break
     link = wifi()
     if link:
         ssid, dbm = link
-        rows.append(("SSID", ssid))
-        rows.append(("RSSI", f"{dbm} dBm" if dbm is not None else "?"))
-        if budget == 3:
-            # Fold the signal in beside the SSID rather than spilling a
-            # one-row second screen for it.
-            rows[2] = ("WIFI", f"{ssid} {dbm}" if dbm is not None else ssid)
-            rows.pop()
+        remaining = budget - len(rows)
+        if remaining >= 2:
+            rows.append(("SSID", ssid))
+            rows.append(("RSSI", f"{dbm} dBm" if dbm is not None else "?"))
+        elif remaining == 1:
+            rows.append(("WIFI", f"{ssid} {dbm}" if dbm is not None else ssid))
     else:
         iface = default_iface()
-        if iface:
+        if iface and len(rows) < budget:
             rows.append(("IF", iface))
     return Page("NET", clock(), rows[:max(2, budget)])
 
@@ -896,6 +948,10 @@ def page_svc(args, cpu_pct, budget):
     rows = []
     for name in installed_services(tuple(args.service)) or []:
         state = service_state(name)
+        if name == "robot-linkd" and state == "active":
+            connected = robot_link_connected()
+            state = "active" if connected else ("no bone" if connected is False
+                                                  else "waiting")
         rows.append((service_label(name),
                      {"active": "up", "inactive": "down", "failed": "FAIL",
                       "activating": "start", "deactivating": "stop"
@@ -1580,7 +1636,7 @@ def main(argv=None):
                 screen_idx += 1
                 last_flip = now
             page = screens[screen_idx % len(screens)]
-            alive = service_state(args.primary) == "active"
+            alive = indicator_alive(args)
 
             try:
                 with frame(display.device) as draw:
