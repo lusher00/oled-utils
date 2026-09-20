@@ -108,6 +108,7 @@ SERVICE_LABELS = {
 
 BATT_PATHS = (
     "/run/batt_status.json",
+    "/run/robot-link/status.json",
     "/run/battery.json",
     "/tmp/batt_status.json",
 )
@@ -121,7 +122,7 @@ FONT_CANDIDATES = (
 )
 
 UNIT_NAME = "oled-status"
-BATT_STALE_SEC = 30.0             # older than this and the reading is unknown
+BATT_STALE_SEC = 120.0            # batt_monitor normally publishes each 60s
 STATUS_WRITE_SEC = 5.0            # how often to republish our own status
 
 # Highlight band on the two-colour panels: rows 0..15 are a separate yellow
@@ -746,6 +747,24 @@ def service_state(name):
     return run(["systemctl", "is-active", name], timeout=2) or "unknown"
 
 
+@cached(1)
+def robot_link_connected(path="/run/robot-link/status.json"):
+    """Pi-to-Bone session state published by robot-linkd, or None if absent."""
+    try:
+        with open(path) as fh:
+            return bool(json.load(fh).get("connected"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def indicator_alive(args):
+    """Use the real Pi-to-Bone session for the heartbeat when available."""
+    services = installed_services(tuple(args.service))
+    if "robot-linkd" in services and service_state("robot-linkd") == "active":
+        return robot_link_connected() is True
+    return service_state(args.primary) == "active"
+
+
 def service_label(name, width=4):
     known = SERVICE_LABELS.get(name)
     if known:
@@ -929,6 +948,10 @@ def page_svc(args, cpu_pct, budget):
     rows = []
     for name in installed_services(tuple(args.service)) or []:
         state = service_state(name)
+        if name == "robot-linkd" and state == "active":
+            connected = robot_link_connected()
+            state = "active" if connected else ("no bone" if connected is False
+                                                  else "waiting")
         rows.append((service_label(name),
                      {"active": "up", "inactive": "down", "failed": "FAIL",
                       "activating": "start", "deactivating": "stop"
@@ -1613,7 +1636,7 @@ def main(argv=None):
                 screen_idx += 1
                 last_flip = now
             page = screens[screen_idx % len(screens)]
-            alive = service_state(args.primary) == "active"
+            alive = indicator_alive(args)
 
             try:
                 with frame(display.device) as draw:
