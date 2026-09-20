@@ -29,7 +29,7 @@ display accepting a draw — and stops at the first link that is actually broken
 ## Pages
 
     BOT   IP, the primary service's state, battery       (the pinned page)
-    NET   hostname, IP, SSID + RSSI or interface
+    NET   hostname, primary IP, second active IP, SSID + RSSI or interface
     SYS   CPU and load, temperature and throttle flags, memory and disk
     SVC   every watched unit's state, battery or board power
 
