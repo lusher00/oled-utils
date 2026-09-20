@@ -1303,6 +1303,11 @@ def unit_text(args):
     #     image uses gpio. Naming a missing group makes systemd exit 216/GROUP.
     #   * StartLimit* with --give-up-after: five starts must fit inside the
     #     interval for systemd to ever give up. 5 x (15 + 5) = 100 < 120.
+    #   * ProtectHome=read-only, not yes: this one-file installer deliberately
+    #     runs the checked-out script in the invoking user's home directory.
+    #     ProtectHome=yes hides that path and systemd exits 200/CHDIR before
+    #     Python starts. Read-only keeps the source visible without allowing
+    #     the service to modify home directories.
     #   * RuntimeDirectory is both where the status file goes and how this
     #     script finds it ($RUNTIME_DIRECTORY), and systemd removes it on stop,
     #     so a stopped service leaves no stale "ok" behind to be believed.
@@ -1326,7 +1331,7 @@ RuntimeDirectory={UNIT_NAME}
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
