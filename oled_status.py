@@ -567,6 +567,35 @@ def ip_address():
         return None
 
 
+@cached(5)
+def ipv4_addresses():
+    """Active non-loopback IPv4 addresses, default-route interface first."""
+    found = []
+    output = run(["ip", "-4", "-o", "addr", "show", "up"])
+    for line in output.splitlines():
+        match = re.search(
+            r"^\d+:\s+([^\s:@]+)(?:@\S+)?\s+inet\s+"
+            r"(\d+\.\d+\.\d+\.\d+)/", line)
+        if not match:
+            continue
+        iface, address = match.groups()
+        if iface != "lo" and not address.startswith("127."):
+            found.append((iface, address))
+    preferred = default_iface()
+    return sorted(found, key=lambda item: item[0] != preferred)
+
+
+def address_label(iface, address):
+    """Short, useful OLED label for an interface address."""
+    if address.startswith("192.168.7.") or iface.startswith("usb"):
+        return "USB"
+    if os.path.isdir(f"/sys/class/net/{iface}/wireless"):
+        return "WIFI"
+    if iface.startswith(("eth", "en")):
+        return "ETH"
+    return iface.upper()[:5]
+
+
 @cached(10)
 def wifi():
     """(ssid, dBm) for the default interface, or None if it isn't wireless."""
@@ -838,21 +867,25 @@ def page_bot(args, cpu_pct, budget):
 
 
 def page_net(args, cpu_pct, budget):
+    primary = ip_address()
     rows = [("HOST", hostname() or "?"),
-            ("IP", ip_address() or "no link")]
+            ("IP", primary or "no link")]
+    for iface, address in ipv4_addresses():
+        if address != primary:
+            rows.append((address_label(iface, address), address))
+            break
     link = wifi()
     if link:
         ssid, dbm = link
-        rows.append(("SSID", ssid))
-        rows.append(("RSSI", f"{dbm} dBm" if dbm is not None else "?"))
-        if budget == 3:
-            # Fold the signal in beside the SSID rather than spilling a
-            # one-row second screen for it.
-            rows[2] = ("WIFI", f"{ssid} {dbm}" if dbm is not None else ssid)
-            rows.pop()
+        remaining = budget - len(rows)
+        if remaining >= 2:
+            rows.append(("SSID", ssid))
+            rows.append(("RSSI", f"{dbm} dBm" if dbm is not None else "?"))
+        elif remaining == 1:
+            rows.append(("WIFI", f"{ssid} {dbm}" if dbm is not None else ssid))
     else:
         iface = default_iface()
-        if iface:
+        if iface and len(rows) < budget:
             rows.append(("IF", iface))
     return Page("NET", clock(), rows[:max(2, budget)])
 
