@@ -87,6 +87,9 @@ The installer adds only I2C access groups that exist on the current machine.
 Most images ship `/dev/i2c-*` as `root:i2c`; the BeagleBone image uses
 `root:gpio`. A unit naming a nonexistent group exits before Python starts with
 systemd status `216/GROUP`, so blindly listing both names is not portable.
+Because the installed unit runs the checked-out script from the invoking
+user's home directory, it uses `ProtectHome=read-only`; `ProtectHome=yes`
+would hide its own executable and working directory and exit with `200/CHDIR`.
 
 The service publishes its own status to `$RUNTIME_DIRECTORY/status.json`, which
 systemd creates on start and removes on stop. That file exists because a
