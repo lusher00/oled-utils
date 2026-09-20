@@ -33,6 +33,12 @@ display accepting a draw — and stops at the first link that is actually broken
     SYS   CPU and load, temperature and throttle flags, memory and disk
     SVC   every watched unit's state, battery or board power
 
+Robot Link is detected automatically. A BeagleBone running
+`robot-link-boned.service` and a Pi running `robot-linkd.service` each show a
+`LINK` row on the SVC page. This row reports the systemd service state; it does
+not yet distinguish a running service from a service that is waiting for its
+peer to connect.
+
 The pinned page is dealt back in between the others, so whatever the cycle is
 doing you are never more than one dwell away from the bot's state. `--pin none`
 turns that off, `--pages bot,sys` narrows the set, `--page-sec` sets the dwell.

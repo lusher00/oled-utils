@@ -88,6 +88,8 @@ I2C_ADDRS = (0x3C, 0x3D)          # some modules are strapped to 0x3D
 KNOWN_SERVICES = (
     "balance_bot",
     "batt_monitor",
+    "robot-link-boned",
+    "robot-linkd",
     "hailo-tracker",
     "tunehud",
     "bbb_oled",
@@ -98,6 +100,8 @@ KNOWN_SERVICES = (
 SERVICE_LABELS = {
     "balance_bot": "BBOT",
     "batt_monitor": "BATM",
+    "robot-link-boned": "LINK",
+    "robot-linkd": "LINK",
     "hailo-tracker": "HAIL",
     "tunehud": "TUNE",
 }
